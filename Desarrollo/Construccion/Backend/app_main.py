@@ -8,19 +8,22 @@ import re
 import json
 import pyodbc
 
-from langchain.chains import RetrievalQA
-from langchain_community.vectorstores import Chroma
-from langchain_community.document_loaders import TextLoader
+# --- 2026 Langchain Modern Imports ---
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
-from langchain.schema import Document
+from langchain_core.documents import Document
 from groq import Groq
 
-from schema_metadata import schema  # External schema definition
-from sql_examples import sql_examples  # External SQL examples
+from schema_metadata import schema  
+from sql_examples import sql_examples  
 
-# Load environment variables
-dotenv_path = Path(r"C:\Users\RENZO\Documents\GitHub\STGRHPBI\Desarrollo\Construccion\Server\.env")
+# Load environment variables dynamically
+base_dir = Path(__file__).resolve().parent.parent
+dotenv_path = base_dir / "Server" / ".env"
 load_dotenv(dotenv_path=dotenv_path)
 
 app = FastAPI()
@@ -35,7 +38,6 @@ app.add_middleware(
 )
 
 # --- SQL Server Config ---
-
 SQL_SERVER_CONFIG = {
     "server": os.getenv("DB_SERVER"),
     "database": os.getenv("DB_DATABASE"),
@@ -48,7 +50,6 @@ class Query(BaseModel):
     prompt: str
 
 # --- Schema Context Builders ---
-
 def build_schema_context(user_query: str) -> str:
     relevant_tables = []
     for table, info in schema.items():
@@ -81,17 +82,12 @@ def build_detailed_schema_context(user_query: str) -> str:
         lines.append("")
     return "\n".join(lines)
 
-
-
-
 # --- SQL Safety ---
-
 def is_safe_sql(sql: str) -> bool:
     sql = sql.strip().lower()
     return sql.startswith("select") and not re.search(r'\b(update|delete|insert|drop|alter|truncate|create)\b', sql)
 
 # --- LLM Setup ---
-
 llm_sql = OllamaLLM(
     model="deepseek-r1:8b",
     model_kwargs={
@@ -104,18 +100,16 @@ llm_sql = OllamaLLM(
     }
 )
 
-
 llm_rag = OllamaLLM(
-    model="deepseek-r1:8b"  # Default parameters for /ask
+    model="deepseek-r1:8b"
 )
 
 # Groq client setup
 groq_api_key = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_api_key)
-groq_model = "openai/gpt-oss-120b"
+groq_model = "openai/gpt-oss-120b" # CORREGIDO: Se actualiaz el modelo porque el anterior esta deprecated
 
 # --- SQL Generator: DeepSeek + Groq Cleaner ---
-
 def generate_sql_query(natural_language_query: str, return_raw=False):
     schema_description = build_schema_context(natural_language_query)
     full_schema_description = build_detailed_schema_context(natural_language_query)
@@ -124,7 +118,6 @@ def generate_sql_query(natural_language_query: str, return_raw=False):
         for ex in sql_examples
     )
 
-    # Stage 1: DeepSeek
     ds_prompt = f"""
 Eres un asistente que convierte preguntas en lenguaje natural a SQL Server válido.
 
@@ -149,7 +142,6 @@ SQL:
     except Exception as e:
         return ("SELECT 'DeepSeek error' AS error_message", "") if return_raw else "SELECT 'DeepSeek error' AS error_message"
 
-    # Stage 2: Groq cleanup + context
     groq_prompt = f"""
 Corrige y valida esta consulta SQL generada por otro modelo. Usa el esquema proporcionado.
 
@@ -184,9 +176,7 @@ Esquema detallado:
         return ("SELECT 'Groq error' AS error_message", raw_sql) if return_raw else "SELECT 'Groq error' AS error_message"
 
 
-
 # --- SQL Execution ---
-
 def execute_sql_query(query: str):
     conn_str = (
         f"DRIVER={SQL_SERVER_CONFIG['driver']};"
@@ -202,8 +192,7 @@ def execute_sql_query(query: str):
         rows = cursor.fetchall()
         return [dict(zip(columns, row)) for row in rows]
 
-# --- RAG Setup ---
-
+# --- RAG Setup (Modernizado a LCEL y Langchain_Chroma) ---
 def fetch_data_from_sql():
     conn_str = (
         f"DRIVER={SQL_SERVER_CONFIG['driver']};"
@@ -214,10 +203,27 @@ def fetch_data_from_sql():
     )
 
     queries = {
-        "ATM": "SELECT * FROM [dbo].[Vista_ATM_Completa]",
-        "Enapres": "SELECT * FROM [dbo].[Vista_Enapres_Completa]",
-        "Gastos": "SELECT * FROM [dbo].[Vista_Gastos_Completa]",
+        "ATM_Contexto": """
+            SELECT DISTINCT 
+                ANIO, DEPARTAMENTO, PROVINCIA, ATM, ALCALDE, UNIDAD_ORGANICA 
+            FROM [dbo].[Vista_ATM_Completa] 
+            WHERE UNIDAD_ORGANICA IS NOT NULL 
+              AND UNIDAD_ORGANICA NOT IN ('sin datos', 'NO INDICA')
+        """,
+        "Gastos_Proyectos": """
+            SELECT DISTINCT 
+                ANIO, DEPARTAMENTO, PROVINCIA, DISTRITO, 
+                EJECUTORA_NOMBRE, 
+                PRODUCTO_PROYECTO_NOMBRE, 
+                ACTIVIDAD_ACCION_OBRA_NOMBRE, 
+                META_NOMBRE 
+            FROM [dbo].[Vista_Gastos_Completa] 
+            WHERE PRODUCTO_PROYECTO_NOMBRE != 'SIN PRODUCTO'
+              AND PRODUCTO_PROYECTO_NOMBRE IS NOT NULL
+        """
     }
+
+
 
     documents = []
     with pyodbc.connect(conn_str) as conn:
@@ -228,24 +234,34 @@ def fetch_data_from_sql():
             cols = [col[0] for col in cursor.description]
             for row in cursor.fetchall():
                 row_dict = dict(zip(cols, row))
-                documents.append(Document(page_content=str(row_dict), metadata={"source": name}))
+                # MEJORA SILENCIOSA: Formato de texto semántico en lugar de JSON duro para mejores embeddings
+                semantic_text = ", ".join([f"{k}: {v}" for k, v in row_dict.items() if v is not None])
+                documents.append(Document(page_content=semantic_text, metadata={"source": name}))
     return documents
 
 def setup_vectorstore(documents, persist_directory="chroma_db"):
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     persist_path = Path(persist_directory)
-    if persist_path.exists():
+    if persist_path.exists() and not documents:
         print(">>> Cargando vectorstore existente")
         return Chroma(persist_directory=persist_directory, embedding_function=embeddings)
+    
     print(">>> Creando nuevo vectorstore")
     return Chroma.from_documents(documents, embeddings, persist_directory=persist_directory)
 
 def create_rag_pipeline(vectorstore):
-    retriever = vectorstore.as_retriever()
-    return RetrievalQA.from_chain_type(llm=llm_rag, chain_type="stuff", retriever=retriever)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    
+    # MEJORA SILENCIOSA: LCEL Chain, reemplazando el deprecado RetrievalQA
+    prompt_template = ChatPromptTemplate.from_template(
+        "Eres un experto en gestión de recursos hídricos en el Perú. Usa el siguiente contexto para responder la pregunta de forma clara y profesional.\n\nContexto:\n{context}\n\nPregunta: {input}\n\nRespuesta:"
+    )
+    combine_docs_chain = create_stuff_documents_chain(llm_rag, prompt_template)
+    retrieval_chain = create_retrieval_chain(retriever, combine_docs_chain)
+    
+    return retrieval_chain
 
 # --- Init pipeline
-
 rag_pipeline = None
 VECTORSTORE_PATH = "chroma_db"
 
@@ -264,22 +280,21 @@ if __name__ == "__main__" or os.getenv("RUNNING_TESTS") != "1":
     initialize_rag_pipeline()
 
 # --- Endpoints ---
-
 @app.post("/ask")
 async def chat_endpoint(query: Query):
     try:
-        result = rag_pipeline.invoke({"query": query.prompt})
-        response_text = result.get("result") if isinstance(result, dict) else str(result)
+        # LCEL usa 'input' en lugar de 'query'
+        result = rag_pipeline.invoke({"input": query.prompt})
+        response_text = result.get("answer") if isinstance(result, dict) else str(result)
         return {"response": response_text}
     except Exception as e:
-        return {"error": f"Error procesando consulta: {str(e)}"}
+        return {"error": f"Error procesando consulta RAG: {str(e)}"}
 
 @app.post("/query")
 async def sql_query_endpoint(query: Query):
     try:
         sql, raw_sql = generate_sql_query(query.prompt, return_raw=True)
 
-        # 1) Detectar placeholders reales como <...> (no confundir con '>' de >=)
         if re.search(r'<[^<>]+>', sql):
             return {
                 "error": "La consulta generada contiene placeholders con '<...>'. Reformula la pregunta.",
@@ -287,16 +302,12 @@ async def sql_query_endpoint(query: Query):
                 "raw_sql": raw_sql
             }
 
-        # 2) Normalizar casos comunes (opcional pero útil):
-        #    Si ANIO se comparó como número (ANIO = 2023) lo convertimos a cadena ('2023')
-        #    Maneja prefijos de alias como "f.ANIO" o "FEC.ANIO"
         sql = re.sub(
             r"(?i)\b([A-Za-z0-9_]+\.)?ANIO\s*=\s*(\d{4})",
             lambda m: (m.group(1) or "") + "ANIO = '" + m.group(2) + "'",
             sql
         )
 
-        # 3) Seguridad básica (ya existente)
         if not is_safe_sql(sql):
             return {
                 "error": "Consulta bloqueada por seguridad. Solo se permiten SELECT.",
